@@ -8,6 +8,7 @@ import {
     updateUser,
     softDeleteUser,
     hardDeleteUser,
+    refreshAccessToken
 } from "../controllers/userController.js";
 import { verifyJWT } from "../middlewares/Authentication.js";
 import { isAdmin, isAdminOrManagerOrSelf } from "../middlewares/Authorization.js";
@@ -16,6 +17,7 @@ const router = express.Router();
 
 router.route("/register").post(createUser);
 router.route("/login").post(loginUser);
+router.route("/refresh-token").post(refreshAccessToken);
 
 router.route("/logout").post(verifyJWT, logoutUser);
 router.route("/allUsers").get(verifyJWT, getAllUsers);

@@ -3,6 +3,8 @@ import ApiResponse from '../utils/ApiResponse.js';
 import ApiError from '../utils/ApiError.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { mongo } from 'mongoose';
+import { connection as redis } from '../config/redis.js';
+import jwt from 'jsonwebtoken';
 
 // Controller to create a new user
 export const createUser = asyncHandler(async (req, res) => {
@@ -54,20 +56,23 @@ export const getAllUsers = asyncHandler(async (req, res) => {
 // Get single user
 export const getUserById = asyncHandler(async (req, res) => {
     const userId = req.params._id || req.params.id;
-    let user;
 
-    try {
-        user = await User.findById(req.params._id).select("-password")
-    } catch (error) {
-        if (error instanceof mongo.Error.CastError) {
-            throw new ApiError(400, "Invalid user ID format")
-        }
-        throw error;
+    // Check cache first
+    const cachedUser = await redis.get(`user:${userId}`);
+    if (cachedUser) {
+        return res
+            .status(200)
+            .json(new ApiResponse(200, JSON.parse(cachedUser), "User fetched successfully (cached)"));
     }
+
+    const user = await User.findById(req.params._id).select("-password")
 
     if (!user) {
         throw new ApiError(404, "User not found")
     }
+
+    // Cache user
+    await redis.set(`user:${userId}`, JSON.stringify(user), 'EX', 3600); // 1 hour
 
     return res
         .status(200)
@@ -77,23 +82,17 @@ export const getUserById = asyncHandler(async (req, res) => {
 // Update user
 export const updateUser = asyncHandler(async (req, res) => {
     const userId = req.params._id || req.params.id;
-    let user;
-
-    try {
-        user = await User.findByIdAndUpdate(userId, req.body, {
+    const user = await User.findByIdAndUpdate(userId, req.body, {
             new: true,
             runValidators: true,
         }).select("-password");
-    } catch (error) {
-        if (error instanceof mongo.Error.CastError) {
-            throw new ApiError(400, "Invalid user ID format")
-        }
-        throw error;
-    }
 
     if (!user) {
         throw new ApiError(404, "User not found")
     }
+
+    // Update cache
+    await redis.set(`user:${userId}`, JSON.stringify(user), 'EX', 3600);
 
     return res
         .status(200)
@@ -103,19 +102,11 @@ export const updateUser = asyncHandler(async (req, res) => {
 // Delete user
 export const softDeleteUser = asyncHandler(async (req, res) => {
     const userId = req.params._id || req.params.id;
-    let user;
-
-    try {
-        user = await User.findByIdAndUpdate(userId,
+    const user = await User.findByIdAndUpdate(userId,
             { isActive: false, deletedAt: new Date() },
             { new: true, runValidators: true }
         ).select("-password");
-    } catch (error) {
-        if (error instanceof mongo.Error.CastError) {
-            throw new ApiError(400, "Invalid user ID format")
-        }
-        throw error;
-    }
+    
     if (!user) {
         throw new ApiError(404, "User not found")
     }
@@ -127,79 +118,113 @@ export const softDeleteUser = asyncHandler(async (req, res) => {
 export const hardDeleteUser = asyncHandler(async (req, res) => {
     const userId = req.params._id || req.params.id;
 
-    let user;
-    try {
-        user = await User.findByIdAndDelete(userId).select("-password");
-    }catch(error){
-        if (error instanceof mongo.Error.CastError) {
-            throw new ApiError(400, "Invalid user ID format")
-        }
-        throw error;
-    }
+    const user = await User.findByIdAndDelete(userId).select("-password");
 
     if (!user) {
         throw new ApiError(404, "User not found")
     }
 
     return res
-    .status(200)
-    .json(new ApiResponse(200, user, "User permanently deleted."));
+        .status(200)
+        .json(new ApiResponse(200, user, "User permanently deleted."));
 });
 
 // Login
-export const loginUser = asyncHandler( async (req, res) => {
+export const loginUser = asyncHandler(async (req, res) => {
     const { email, password } = req.body;
 
-    if(!email || !password){
+    if (!email || !password) {
         throw new ApiError(400, "Email and password are required");
     }
 
-    const user = await User.findOne({email}).select("+password");
+    const user = await User.findOne({ email }).select("+password");
 
-    if(!user || !(await user.matchPassword(password))){
+    if (!user || !(await user.matchPassword(password))) {
         throw new ApiError(401, "Invalid email or password");
     }
 
-    if(!user.isActive){
+    if (!user.isActive) {
         throw new ApiError(403, "Account is deactivated");
     }
 
     const accessToken = await user.generateAccessToken();
     const refreshToken = await user.generateRefreshToken();
 
-    user.refreshToken = refreshToken;
-    await user.save({validateBeforeSave: false});
+    // Store refresh token in Redis
+    await redis.set(`refresh_token:${user._id}`, refreshToken, 'EX', 7 * 24 * 60 * 60); // 7 days
 
+    // Cache user profile
     const loggedInUser = await User.findById(user._id).select("-password -refreshToken");
+    await redis.set(`user:${user._id}`, JSON.stringify(loggedInUser), 'EX', 3600); // 1 hour
 
     const cookieOptions = {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
-        sameSite : "strict",
-        maxAge: 7*24*60*60*1000
+        sameSite: "strict",
+        maxAge: 7 * 24 * 60 * 60 * 1000
     }
 
     return res
-    .status(200)
-    .cookie("refreshToken", refreshToken, cookieOptions)
-    .json(new ApiResponse(200, {user:loggedInUser, accessToken}, "Login successful"));
+        .status(200)
+        .cookie("refreshToken", refreshToken, cookieOptions)
+        .json(new ApiResponse(200, { user: loggedInUser, accessToken }, "Login successful"));
 })
 
-// logout
-export const logoutUser = asyncHandler(async(req, res)=> {
-    const user = await User.findByIdAndUpdate(req.user._id,
-        {$set: {refreshToken: null}},
-        {new: true}
-    )
+// Refresh AccessToken
+export const refreshAccessToken = asyncHandler(async (req, res) => {
+    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken;
 
-    const options ={
+    if (!incomingRefreshToken) {
+        throw new ApiError(401, "Unauthorized request: Refresh token not found")
+    }
+
+    const decodedToken = jwt.verify(incomingRefreshToken, process.env.REFRESH_TOKEN_SECRET);
+
+    const user = await User.findById(decodedToken?._id);
+
+    if (!user) {
+        throw new ApiError(401, "Invalid refresh token");
+    }
+
+    // Verify against Redis
+    const storedRefreshToken = await redis.get(`refresh_token:${user._id}`);
+
+    if (incomingRefreshToken !== storedRefreshToken) {
+        throw new ApiError(401, "Refresh token is expired or used");
+    }
+
+    const accessToken = await user.generateAccessToken();
+    const newRefreshToken = await user.generateRefreshToken();
+
+    // Update Redis
+    await redis.set(`refresh_token:${user._id}`, newRefreshToken, 'EX', 7 * 24 * 60 * 60);
+
+    const options = {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
         sameSite: "strict"
     }
 
     return res
-    .status(200)
-    .clearCookie("refreshToken", options)
-    .json(new ApiResponse(200, {}, "User logged out successfully"))
+        .status(200)
+        .cookie("refreshToken", newRefreshToken, options)
+        .json(new ApiResponse(200, { accessToken, refreshToken: newRefreshToken }, "Access token refreshed"))
+})
+
+// logout
+export const logoutUser = asyncHandler(async (req, res) => {
+    // Remove from Redis
+    await redis.del(`refresh_token:${req.user._id}`);
+    await redis.del(`user:${req.user._id}`);
+
+    const options = {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict"
+    }
+
+    return res
+        .status(200)
+        .clearCookie("refreshToken", options)
+        .json(new ApiResponse(200, {}, "User logged out successfully"))
 })
